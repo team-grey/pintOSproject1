@@ -9,7 +9,7 @@
 #include "threads/intr-stubs.h"
 #include "threads/palloc.h"
 #include "threads/switch.h"
-#include "threads/synch.h"
+//#include "threads/synch.h"
 #include "threads/vaddr.h"
 #ifdef USERPROG
 #include "userprog/process.h"
@@ -23,6 +23,9 @@
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
 static struct list ready_list;
+
+/* List of all threads currently sleeping. */
+static struct list sleep_list;
 
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
@@ -91,6 +94,7 @@ thread_init (void)
 
   lock_init (&tid_lock);
   list_init (&ready_list);
+  list_init (&sleep_list);
   list_init (&all_list);
 
   /* Set up a thread structure for the running thread. */
@@ -201,7 +205,59 @@ thread_create (const char *name, int priority,
   /* Add to run queue. */
   thread_unblock (t);
 
+  /*Yields the processor if a higer priority thread is created (such as this one)
+    I did it here as opposed to thread_unblock().  From what I got, a function that calls
+    thread_unblock() could want to put a thread on the ready queue and update something at the same time,
+    but if it gets interrupted in the middle of doing those two things, because thread_unblock()
+    put a higher priority thread on the ready queue, and thus, made the current thread yield to it,
+    it would no longer be an atomic operation, for example, trying to assign an int to a number, but
+    while it tried to do that, it saw the number was one and decided to print a string and play a game
+    of tic-tac-toe or something.  If I need to handle other cases, I can just write them
+    in that section of the code.*/
+
+  if(!thread_check_priority())
+    thread_yield();
+
   return tid;
+}
+
+
+/* Causes the current thread to sleep for t ticks. */
+void
+thread_sleep(int64_t t)
+{
+  enum intr_level old_level;
+
+  old_level = intr_disable ();
+
+  thread_current()->ticks = t;
+  list_insert_ordered(&sleep_list, &thread_current()->sleep, less_sleep, NULL);
+  sema_down(&thread_current()->sleep_sema);
+
+  intr_set_level (old_level);
+}
+
+bool
+less_sleep(const struct list_elem* cur, const struct list_elem* other, void *aux)
+{
+  struct thread *c, *o;
+  c = list_entry (cur, struct thread, sleep);
+  o = list_entry (other, struct thread, sleep);
+  return c->ticks < o->ticks;
+}
+
+/* Wakes up any threads that may be sleeping*/
+void
+thread_wake(int64_t cur)
+{
+  if(!list_empty(&sleep_list)){
+  while(list_entry(list_begin(&sleep_list), struct thread, sleep)->ticks < cur &&
+      list_entry(list_begin(&sleep_list), struct thread, sleep)->ticks > -1){
+      struct thread * t = list_entry(list_pop_front(&sleep_list), struct thread, sleep);
+      t->ticks = -1;
+      sema_up(&t->sleep_sema);
+  }
+ }
 }
 
 /* Puts the current thread to sleep.  It will not be scheduled
@@ -236,6 +292,7 @@ thread_unblock (struct thread *t)
   ASSERT (is_thread (t));
 
   old_level = intr_disable ();
+
   ASSERT (t->status == THREAD_BLOCKED);
   list_push_back (&ready_list, &t->elem);
   t->status = THREAD_READY;
@@ -336,6 +393,8 @@ void
 thread_set_priority (int new_priority) 
 {
   thread_current ()->priority = new_priority;
+  if(!thread_check_priority())
+    thread_yield();
 }
 
 /* Returns the current thread's priority. */
@@ -462,7 +521,10 @@ init_thread (struct thread *t, const char *name, int priority)
   strlcpy (t->name, name, sizeof t->name);
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
+  t->ticks = -1;
   t->magic = THREAD_MAGIC;
+
+  sema_init(&t->sleep_sema, 0);
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
@@ -493,7 +555,53 @@ next_thread_to_run (void)
   if (list_empty (&ready_list))
     return idle_thread;
   else
-    return list_entry (list_pop_front (&ready_list), struct thread, elem);
+    return thread_remove_priority();
+}
+
+/* Removes the thread from the ready queue with the highest priority */
+struct thread *
+thread_remove_priority(void)
+{
+  struct list_elem *e, *remove = NULL;
+  int priority = -1;
+
+  ASSERT(!list_empty (&ready_list));/*It BETTER NOT be empty */
+  /*For loop used to iterate through all threads ready to run */
+  for (e = list_begin (&ready_list); e != list_end (&ready_list);
+       e = list_next (e))
+    {
+      ASSERT(e != NULL);
+      struct thread *t = list_entry (e, struct thread, elem);
+      if(priority < t->priority) {
+          priority = t->priority;
+          remove = e;
+      }
+    }
+  ASSERT(remove != NULL); /*There HAS to be an element when I do this */
+  list_remove(remove);/* This thing returns the next element, so I can't use it
+   to get the current element and include it in the return statement*/
+  return list_entry (remove, struct thread, elem);
+  
+}
+
+/* Checks if the current thread does still has the highest priority. */
+bool
+thread_check_priority(void)
+{
+  struct list_elem *e;
+  int priority = thread_current()->priority;
+
+  ASSERT(!list_empty (&ready_list));/*It BETTER NOT be empty */
+  /*For loop used to iterate through all threads ready to run */
+  for (e = list_begin (&ready_list); e != list_end (&ready_list);
+       e = list_next (e))
+    {
+      if(priority < list_entry (e, struct thread, elem)->priority) {
+          return false;
+      }
+    }
+  return true;
+  
 }
 
 /* Completes a thread switch by activating the new thread's page
